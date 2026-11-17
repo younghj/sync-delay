@@ -112,6 +112,8 @@ private final class AudioRing {
     func setGain(_ value: Float) { atomicStore(gain, value.bitPattern) }
     func setChannelMask(_ mask: UInt32) { atomicStore(channelMask, mask) }
     func peak(_ channel: Int) -> Float { Float(bitPattern: atomicLoad(peaks + channel)) }
+    /// Producer and consumer positions; the watchdog uses them to notice when audio stops flowing.
+    func positions() -> (written: UInt32, read: UInt32) { (atomicLoad(producerIndex), atomicLoad(consumerIndex)) }
 
     // Producer: publish samples only after writing them. Keep maxDelay frames behind the dry head intact.
     func write(_ source: UnsafePointer<Float>, frames: UInt32) {
@@ -298,7 +300,8 @@ private final class Equalizer {
     }
 }
 
-private final class Engine {
+// Configured and torn down on a background queue so slow devices (Bluetooth) can't hang the UI.
+private final class Engine: @unchecked Sendable {
     let ring: AudioRing
     let eq: Equalizer
     let sampleRate: Double
@@ -422,17 +425,39 @@ private func setHardwareVolume(_ id: AudioDeviceID, _ value: Double) {
     }
 }
 
+/// Writes hardware volume off the main thread, keeping only the latest value per device.
+/// A slider drag fires many changes and each Bluetooth write is a slow round trip.
+private final class HardwareVolumeWriter: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "SyncDelay.volume", qos: .userInitiated)
+    private let lock = NSLock()
+    private var pending: [AudioDeviceID: Double] = [:]
+
+    func set(_ id: AudioDeviceID, _ value: Double) {
+        lock.lock(); let idle = pending.isEmpty; pending[id] = value; lock.unlock()
+        guard idle else { return }
+        queue.async { [self] in
+            while true {
+                lock.lock()
+                guard let (device, latest) = pending.first else { lock.unlock(); return }
+                pending[device] = nil
+                lock.unlock()
+                setHardwareVolume(device, latest)
+            }
+        }
+    }
+}
+
 // MARK: Updates from GitHub Releases
 
+/// This build is a fork with local changes, so it never installs the upstream binary over itself.
+/// It only reports that upstream has a newer release; `update-from-upstream.sh` merges and rebuilds.
 @MainActor
 private final class Updater: ObservableObject {
     static let shared = Updater()
     static let repo = "leviholliday/sync-delay"
 
     @Published var availableVersion: String?
-    @Published var isInstalling = false
     @Published var message: String?
-    private var downloadURL: URL?
 
     var currentVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0" }
 
@@ -452,14 +477,10 @@ private final class Updater: ObservableObject {
                 request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
                 let (data, _) = try await URLSession.shared.data(for: request)
                 guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let tag = json["tag_name"] as? String,
-                      let assets = json["assets"] as? [[String: Any]],
-                      let zip = assets.first(where: { ($0["name"] as? String)?.hasSuffix(".zip") == true }),
-                      let urlString = zip["browser_download_url"] as? String else { throw URLError(.badServerResponse) }
+                      let tag = json["tag_name"] as? String else { throw URLError(.badServerResponse) }
                 let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
                 if Self.isNewer(version, than: currentVersion) {
-                    availableVersion = version; downloadURL = URL(string: urlString); message = nil
-                    if ProcessInfo.processInfo.environment["SYNCDELAY_TEST_UPDATE"] != nil { install() }
+                    availableVersion = version; message = nil
                 } else {
                     availableVersion = nil
                     if userInitiated { message = "Sync Delay \(currentVersion) is the latest version." }
@@ -470,41 +491,8 @@ private final class Updater: ObservableObject {
         }
     }
 
-    /// Downloads the release zip, then a helper shell swaps the bundle in place once this process exits and relaunches it.
-    func install() {
-        guard let downloadURL, !isInstalling else { return }
-        isInstalling = true; message = "Downloading update…"
-        Task {
-            do {
-                let (file, _) = try await URLSession.shared.download(from: downloadURL)
-                let work = FileManager.default.temporaryDirectory.appendingPathComponent("SyncDelayUpdate-\(UUID().uuidString)")
-                try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
-                let zip = work.appendingPathComponent("update.zip")
-                try FileManager.default.moveItem(at: file, to: zip)
-                let unzip = Process()
-                unzip.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-                unzip.arguments = ["-x", "-k", zip.path, work.path]
-                try unzip.run(); unzip.waitUntilExit()
-                guard unzip.terminationStatus == 0,
-                      let newApp = try FileManager.default.contentsOfDirectory(at: work, includingPropertiesForKeys: nil).first(where: { $0.pathExtension == "app" })
-                else { throw NSError(domain: "SyncDelay", code: 1, userInfo: [NSLocalizedDescriptionKey: "The update archive is invalid."]) }
-
-                let destination = Bundle.main.bundleURL.path
-                let script = """
-                while kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null; do sleep 0.2; done
-                rm -rf "$DEST" && mv "$NEW" "$DEST" && xattr -dr com.apple.quarantine "$DEST"
-                open "$DEST"
-                """
-                let swap = Process()
-                swap.executableURL = URL(fileURLWithPath: "/bin/sh")
-                swap.arguments = ["-c", script]
-                swap.environment = ["DEST": destination, "NEW": newApp.path, "PATH": "/usr/bin:/bin:/usr/sbin"]
-                try swap.run()
-                NSApplication.shared.terminate(nil)
-            } catch {
-                isInstalling = false; message = "Update failed: \(error.localizedDescription)"
-            }
-        }
+    func openReleasePage() {
+        NSWorkspace.shared.open(URL(string: "https://github.com/\(Self.repo)/releases/latest")!)
     }
 }
 
@@ -514,6 +502,19 @@ private struct DeviceChoice: Identifiable {
     let uid: String
     let inputChannels: UInt32
     let outputChannels: UInt32
+}
+
+/// Level meter values live in their own object so only the meter bars redraw 20 times a second,
+/// not the whole window.
+@MainActor
+private final class MeterModel: ObservableObject {
+    @Published private(set) var levels: (left: Float, right: Float) = (0, 0)
+
+    func update(left: Float, right: Float) {
+        guard abs(left - levels.left) > 0.003 || abs(right - levels.right) > 0.003 else { return }
+        levels = (left, right)
+    }
+    func reset() { if levels.left != 0 || levels.right != 0 { levels = (0, 0) } }
 }
 
 @MainActor
@@ -538,17 +539,30 @@ private final class SyncDelayModel: ObservableObject {
     @Published var outputVolumes: [OutputVolume] = []
     @Published var eqEnabled: Bool { didSet { UserDefaults.standard.set(eqEnabled, forKey: "eqEnabled"); applyEQ() } }
     @Published var eqPreset: String { didSet { UserDefaults.standard.set(eqPreset, forKey: "eqPreset"); if let p = EQPreset.all.first(where: { $0.name == eqPreset }), p.gains != eqGains { eqGains = p.gains } } }
-    @Published var eqGains: [Double] { didSet { UserDefaults.standard.set(eqGains, forKey: "eqGains"); if !autoEQ { liveGains = eqGains }; applyEQ() } }
-    @Published var autoEQ: Bool { didSet { UserDefaults.standard.set(autoEQ, forKey: "autoEQ"); if !autoEQ { liveGains = eqGains; applyEQ() } } }
-    /// Gains actually applied; equals eqGains unless Auto EQ is steering them.
+    @Published var eqGains: [Double] { didSet { UserDefaults.standard.set(eqGains, forKey: "eqGains"); if !autoEQ { appliedGains = eqGains; liveGains = eqGains }; applyEQ() } }
+    @Published var autoEQ: Bool { didSet { UserDefaults.standard.set(autoEQ, forKey: "autoEQ"); if !autoEQ { appliedGains = eqGains; liveGains = eqGains; applyEQ() } } }
+    /// Gains shown on the sliders; equals eqGains unless Auto EQ is steering them. Published at ~2 Hz.
     @Published var liveGains: [Double] = Array(repeating: 0, count: eqBandCount)
     @Published var isRunning = false
+    @Published var isConnecting = false
     @Published var hasError = false
     @Published var status = "Ready to connect"
-    @Published var levels: (left: Float, right: Float) = (0, 0)
+    let meter = MeterModel()
+
+    /// Gains actually sent to the EQ, updated every Auto EQ step.
+    private var appliedGains: [Double] = Array(repeating: 0, count: eqBandCount)
     private var engine: Engine?
-    private var meterTimer: Timer?
+    /// Serial queue for Core Audio unit setup and teardown, which can block for seconds on Bluetooth devices.
+    private let audioQueue = DispatchQueue(label: "SyncDelay.engine", qos: .userInitiated)
+    private var engineGeneration = 0
+    private let volumeWriter = HardwareVolumeWriter()
+    private var tickTimer: Timer?
+    private var tick = 0
     private var deviceListener: AudioObjectPropertyListenerBlock?
+    private var refreshTask: Task<Void, Never>?
+    private var lastPositions: (written: UInt32, read: UInt32)?
+    private var stalledSeconds = 0
+    private var recentRestarts: [Date] = []
 
     var inputDevices: [DeviceChoice] { devices.filter { $0.inputChannels >= 2 } }
     var outputDevices: [DeviceChoice] { devices.filter { $0.outputChannels >= 2 } }
@@ -570,31 +584,57 @@ private final class SyncDelayModel: ObservableObject {
         eqGains = savedGains?.count == eqBandCount ? savedGains! : Array(repeating: 0, count: eqBandCount)
         autoEQ = defaults.bool(forKey: "autoEQ")
         liveGains = eqGains
+        appliedGains = eqGains
         refreshDevices()
         watchDevices()
-        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in Task { @MainActor in self?.reloadOutputVolumes() } }
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in guard let self else { return }; Task { @MainActor in self.reloadOutputVolumes() } }
+        // Audio units often stop delivering audio after sleep; reconnect once the hardware is back.
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard self.isRunning else { return }
+                self.startEngine(note: "reconnected after sleep")
+            }
+        }
         if autoStart, !outputUID.isEmpty { start() }
     }
-    deinit { engine?.stop(); meterTimer?.invalidate() }
+    deinit { engine?.stop(); tickTimer?.invalidate() }
 
     private func watchDevices() {
         var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in Task { @MainActor in self?.refreshDevices() } }
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in guard let self else { return }; Task { @MainActor in self.scheduleRefresh() } }
         deviceListener = block
         AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main, block)
     }
 
+    /// Device changes arrive in bursts (a Bluetooth connect or aggregate rebuild fires several); refresh once they settle.
+    private func scheduleRefresh() {
+        refreshTask?.cancel()
+        refreshTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard !Task.isCancelled else { return }
+            self?.refreshDevices()
+        }
+    }
+
     func reloadOutputVolumes() {
-        guard !outputUID.isEmpty, let (outputID, _) = try? findDevice(outputUID) else { outputVolumes = []; return }
+        guard !outputUID.isEmpty, let all = try? allDevices() else { outputVolumes = []; return }
+        // One pass over the device list instead of a full re-scan per aggregate member.
+        var byUID: [String: (AudioDeviceID, String)] = [:]
+        for id in all {
+            if let uid = stringProperty(id, kAudioDevicePropertyDeviceUID) { byUID[uid] = (id, stringProperty(id, kAudioObjectPropertyName) ?? "Unknown") }
+        }
+        guard let (outputID, _) = byUID[outputUID] else { outputVolumes = []; return }
         outputVolumes = outputMemberUIDs(outputID, uid: outputUID).compactMap { uid in
-            guard let (id, name) = try? findDevice(uid), let value = hardwareVolume(id) else { return nil }
+            guard let (id, name) = byUID[uid], let value = hardwareVolume(id) else { return nil }
             return OutputVolume(id: uid, name: name, deviceID: id, value: value)
         }
     }
 
     func setOutputVolume(_ uid: String, _ value: Double) {
         guard let index = outputVolumes.firstIndex(where: { $0.id == uid }) else { return }
-        setHardwareVolume(outputVolumes[index].deviceID, value)
+        volumeWriter.set(outputVolumes[index].deviceID, value)
         outputVolumes[index].value = value
     }
 
@@ -607,7 +647,7 @@ private final class SyncDelayModel: ObservableObject {
                     outputChannels: (try? channelCount(id, scope: kAudioDevicePropertyScopeOutput)) ?? 0)
             }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
             if !devices.contains(where: { $0.uid == inputUID }), let blackHole = devices.first(where: { $0.name.localizedCaseInsensitiveContains("BlackHole") }) { inputUID = blackHole.uid }
-            if isRunning {
+            if isRunning || isConnecting {
                 if !devices.contains(where: { $0.uid == inputUID }) || !devices.contains(where: { $0.uid == outputUID }) {
                     stop(); hasError = true; status = "A selected device disconnected. Reconnect it and press Start Sync."
                 }
@@ -643,8 +683,16 @@ private final class SyncDelayModel: ObservableObject {
 
     private var channelMask: UInt32 { delayedChannels.filter { $0 < 32 }.reduce(0) { $0 | (1 << UInt32($1)) } }
 
-    private func startEngine() {
-        engine?.stop(); engine = nil; isRunning = false; stopMeters()
+    /// Stops the current engine on the audio queue and invalidates any start still in flight.
+    private func tearDownEngine() {
+        engineGeneration += 1
+        if let old = engine { engine = nil; audioQueue.async { old.stop() } }
+        isRunning = false; isConnecting = false
+        stopTicks()
+    }
+
+    private func startEngine(note: String? = nil) {
+        tearDownEngine()
         do {
             guard !inputUID.isEmpty, !outputUID.isEmpty else { throw NSError(domain: "SyncDelay", code: 1, userInfo: [NSLocalizedDescriptionKey: "Select both an input device and an Aggregate Device."]) }
             let (inputID, inputName) = try findDevice(inputUID)
@@ -660,18 +708,37 @@ private final class SyncDelayModel: ObservableObject {
             let sampleRate = 48_000.0
             let engine = Engine(channelMask: channelMask, sampleRate: sampleRate, delayFrames: UInt32((delayMS * sampleRate / 1000).rounded()))
             engine.ring.setGain(gainValue)
-            engine.eq.set(gains: liveGains, enabled: eqEnabled)
-            try engine.configure(inputDevice: inputID, outputDevice: outputID, outputChannelCount: outputs)
-            try engine.start()
-            self.engine = engine
-            isRunning = true
+            engine.eq.set(gains: appliedGains, enabled: eqEnabled)
+            let generation = engineGeneration
+            isConnecting = true
             hasError = false
-            status = "In sync · \(inputName) → \(outputName) · \(outputs) channels"
-            startMeters()
-        } catch { engine?.stop(); engine = nil; hasError = true; status = error.localizedDescription }
+            status = "Connecting · \(inputName) → \(outputName)…"
+            audioQueue.async { [weak self] in
+                let failure: Error?
+                do {
+                    try engine.configure(inputDevice: inputID, outputDevice: outputID, outputChannelCount: outputs)
+                    try engine.start()
+                    failure = nil
+                } catch { engine.stop(); failure = error }
+                guard let self else { engine.stop(); return }
+                Task { @MainActor in
+                    guard generation == self.engineGeneration else {
+                        // Stopped or restarted while this start was in flight.
+                        self.audioQueue.async { engine.stop() }
+                        return
+                    }
+                    self.isConnecting = false
+                    if let failure { self.hasError = true; self.status = failure.localizedDescription; return }
+                    self.engine = engine
+                    self.isRunning = true
+                    self.status = "In sync · \(inputName) → \(outputName) · \(outputs) channels" + (note.map { " · \($0)" } ?? "")
+                    self.startTicks()
+                }
+            }
+        } catch { hasError = true; status = error.localizedDescription }
     }
 
-    func stop() { engine?.stop(); engine = nil; isRunning = false; hasError = false; stopMeters(); status = "Stopped · your settings are saved" }
+    func stop() { tearDownEngine(); hasError = false; status = "Stopped · your settings are saved" }
     func adjustDelay(_ amount: Double) { delayMS += amount }
     func resetDelay() { delayMS = Self.defaultDelay }
     func toggleChannel(_ channel: Int) {
@@ -680,7 +747,7 @@ private final class SyncDelayModel: ObservableObject {
     private func applyDelay() { guard let engine else { return }; engine.ring.setDelay(UInt32((delayMS * engine.sampleRate / 1000).rounded())) }
     private var gainValue: Float { muted ? 0 : Float(volume * volume) } // squared for a natural-feeling taper
     private func applyGain() { engine?.ring.setGain(gainValue) }
-    private func applyEQ() { engine?.eq.set(gains: liveGains, enabled: eqEnabled) }
+    private func applyEQ() { engine?.eq.set(gains: appliedGains, enabled: eqEnabled) }
     func setBand(_ band: Int, _ gain: Double) {
         var gains = eqGains; gains[band] = gain; eqGains = gains
         if EQPreset.all.first(where: { $0.name == eqPreset })?.gains != gains { eqPreset = "Custom" }
@@ -688,7 +755,7 @@ private final class SyncDelayModel: ObservableObject {
 
     /// Typical long-term music balance per band (dB, relative) as measured by the analyzer.
     private static let referenceBalance: [Double] = [4, 3, 1, 0, -3, -7]
-    private var autoTick = 0
+    private var autoSteps = 0
     /// Nudges each band so the song's measured balance moves toward the reference, then layers the preset on top.
     private func stepAutoEQ() {
         guard autoEQ, eqEnabled, let eq = engine?.eq else { return }
@@ -698,32 +765,75 @@ private final class SyncDelayModel: ObservableObject {
         var correction = (0..<eqBandCount).map { min(6, max(-6, (Self.referenceBalance[$0] - (levels[$0] - mean)) * 0.5)) }
         let offset = correction.reduce(0, +) / Double(eqBandCount)
         correction = correction.map { $0 - offset }
-        liveGains = (0..<eqBandCount).map { band in
+        appliedGains = (0..<eqBandCount).map { band in
             let target = min(12, max(-12, eqGains[band] + correction[band]))
-            return liveGains[band] + (target - liveGains[band]) * 0.04 // ~2.5 s glide
+            return appliedGains[band] + (target - appliedGains[band]) * 0.04 // ~2.5 s glide
         }
         applyEQ()
+        // The sliders only need to follow along; publishing every step redraws the whole window.
+        autoSteps += 1
+        if autoSteps % 5 == 0 { liveGains = appliedGains }
     }
 
     private func applyChannels() { engine?.ring.setChannelMask(channelMask) }
 
-    private func startMeters() {
-        meterTimer?.invalidate()
-        meterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, let ring = self.engine?.ring else { return }
-                func shape(_ peak: Float, _ previous: Float) -> Float {
-                    let db = 20 * log10(max(peak, 0.000_001))
-                    return max(min(1, max(0, (db + 60) / 60)), previous * 0.86)
-                }
-                if ProcessInfo.processInfo.environment["SYNCDELAY_DEBUG"] != nil { let st = ring.stats; NSLog("SD stats err=%d under=%d drop=%d over=%d", st[0], st[1], st[2], st[3]) }
-                self.autoTick += 1
-                if self.autoTick % 3 == 0 { self.stepAutoEQ() }
-                self.levels = (shape(ring.peak(0), self.levels.left), shape(ring.peak(1), self.levels.right))
+    /// True when a Sync Delay window is on screen and not fully covered. The menu bar item doesn't count.
+    private var windowVisible: Bool {
+        NSApp.windows.contains { $0.isVisible && $0.canBecomeMain && $0.occlusionState.contains(.visible) }
+    }
+
+    /// One 20 Hz timer while running: meters (only when visible), Auto EQ at 10 Hz, and a 1 Hz stall watchdog.
+    private func startTicks() {
+        tickTimer?.invalidate()
+        tick = 0; lastPositions = nil; stalledSeconds = 0
+        let timer = Timer(timeInterval: 1.0 / 20, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in self.onTick() }
+        }
+        timer.tolerance = 0.01
+        RunLoop.main.add(timer, forMode: .common)
+        tickTimer = timer
+    }
+    private func stopTicks() { tickTimer?.invalidate(); tickTimer = nil; meter.reset() }
+
+    private func onTick() {
+        guard let ring = engine?.ring else { return }
+        tick += 1
+        if windowVisible {
+            func shape(_ peak: Float, _ previous: Float) -> Float {
+                let db = 20 * log10(max(peak, 0.000_001))
+                return max(min(1, max(0, (db + 60) / 60)), previous * 0.8)
             }
+            let previous = meter.levels
+            meter.update(left: shape(ring.peak(0), previous.left), right: shape(ring.peak(1), previous.right))
+        } else {
+            meter.reset()
+        }
+        if tick % 2 == 0 { stepAutoEQ() }
+        if tick % 20 == 0 { checkForStall(ring) }
+    }
+
+    /// If either side of the ring stops moving for 3 seconds the devices stopped delivering audio
+    /// (a Bluetooth speaker dropped out of the aggregate, a sample-rate switch, etc.). Reconnect,
+    /// but give up after 3 tries in a minute so a missing device doesn't cause a restart loop.
+    private func checkForStall(_ ring: AudioRing) {
+        let now = ring.positions()
+        defer { lastPositions = now }
+        if ProcessInfo.processInfo.environment["SYNCDELAY_DEBUG"] != nil {
+            let st = ring.stats; NSLog("SD stats err=%d under=%d drop=%d over=%d", st[0], st[1], st[2], st[3])
+        }
+        guard let last = lastPositions else { return }
+        stalledSeconds = (last.written == now.written || last.read == now.read) ? stalledSeconds + 1 : 0
+        guard stalledSeconds >= 3 else { return }
+        recentRestarts = recentRestarts.filter { $0.timeIntervalSinceNow > -60 } + [Date()]
+        if recentRestarts.count > 3 {
+            stop(); hasError = true
+            status = "Audio stopped flowing and reconnecting didn't help. Check your speakers, then press Start."
+        } else {
+            NSLog("Sync Delay: audio stalled, reconnecting")
+            startEngine(note: "reconnected after audio stalled")
         }
     }
-    private func stopMeters() { meterTimer?.invalidate(); meterTimer = nil; levels = (0, 0) }
 }
 
 private struct LevelBar: View {
@@ -780,8 +890,62 @@ private struct ClearInitialFocus: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
+/// The two level bars watch the meter on their own, so meter updates don't redraw the rest of the window.
+private struct MeterRow: View {
+    @ObservedObject var meter: MeterModel
+    var body: some View {
+        LabeledContent("Level") {
+            VStack(spacing: 3) { LevelBar(level: meter.levels.left); LevelBar(level: meter.levels.right) }.frame(width: 160)
+        }
+    }
+}
+
+/// Menu bar controls, so sync keeps running and stays reachable with the window closed.
+private struct MenuBarContent: View {
+    @ObservedObject var model: SyncDelayModel
+    @Environment(\.openWindow) private var openWindow
+
+    private var summary: String {
+        if model.isRunning { return model.muted ? "In sync · muted" : "In sync" }
+        if model.isConnecting { return "Connecting…" }
+        return model.hasError ? "Not running · open the window for details" : "Stopped"
+    }
+
+    private func showWindow() {
+        NSApp.setActivationPolicy(.regular)
+        openWindow(id: mainWindowID)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    var body: some View {
+        Text(summary)
+        if model.isRunning || model.isConnecting {
+            Button("Stop Sync") { model.stop() }
+        } else {
+            Button("Start Sync") { model.start() }
+        }
+        Divider()
+        Menu("Delay: \(Int(model.delayMS.rounded())) ms") {
+            Button("+5 ms") { model.adjustDelay(5) }
+            Button("+1 ms") { model.adjustDelay(1) }
+            Button("−1 ms") { model.adjustDelay(-1) }
+            Button("−5 ms") { model.adjustDelay(-5) }
+            Divider()
+            Button("Reset to \(Int(SyncDelayModel.defaultDelay)) ms") { model.resetDelay() }
+        }
+        Toggle("Mute", isOn: $model.muted)
+        Divider()
+        Button("Open Sync Delay") { showWindow() }
+        Button("Check for Updates…") { Updater.shared.check(userInitiated: true); showWindow() }
+        Divider()
+        Button("Quit Sync Delay") { NSApp.terminate(nil) }.keyboardShortcut("q")
+    }
+}
+
+private let mainWindowID = "main"
+
 private struct ContentView: View {
-    @StateObject private var model = SyncDelayModel()
+    @ObservedObject var model: SyncDelayModel
     @ObservedObject private var updater = Updater.shared
 
     var body: some View {
@@ -840,9 +1004,7 @@ private struct ContentView: View {
                         .monospacedDigit().foregroundStyle(.secondary).frame(width: 40, alignment: .trailing)
                 }
                 if model.isRunning {
-                    LabeledContent("Level") {
-                        VStack(spacing: 3) { LevelBar(level: model.levels.left); LevelBar(level: model.levels.right) }.frame(width: 160)
-                    }
+                    MeterRow(meter: model.meter)
                 }
             }
 
@@ -866,7 +1028,7 @@ private struct ContentView: View {
                         .foregroundStyle(model.hasError ? Color.red : Color.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 12)
-                    if model.isRunning {
+                    if model.isRunning || model.isConnecting {
                         Button("Stop") { model.stop() }.keyboardShortcut(".", modifiers: .command)
                     } else {
                         Button("Start") { model.start() }.keyboardShortcut(.return, modifiers: .command).buttonStyle(.borderedProminent)
@@ -874,11 +1036,14 @@ private struct ContentView: View {
                 }
                 if let version = updater.availableVersion {
                     HStack {
-                        Label("Sync Delay \(version) is available", systemImage: "arrow.down.circle")
-                            .font(.callout)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Label("Sync Delay \(version) is available upstream", systemImage: "arrow.down.circle")
+                                .font(.callout)
+                            Text("Merge it into your build with update-from-upstream.sh.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                         Spacer()
-                        Button(updater.isInstalling ? "Installing…" : "Install & Relaunch") { updater.install() }
-                            .disabled(updater.isInstalling)
+                        Button("View Release") { updater.openReleasePage() }
                     }
                 }
                 if let message = updater.message {
@@ -890,6 +1055,8 @@ private struct ContentView: View {
                     Button("Refresh Devices") { model.refreshDevices() }.buttonStyle(.link)
                 }
                 .font(.callout)
+                Text("Closing this window keeps sync running. Use the menu bar icon to reopen it or quit.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
@@ -935,32 +1102,46 @@ private struct ContentView: View {
         .formStyle(.grouped)
         .frame(width: 360)
         }
-        .frame(height: 600 + (model.outputVolumes.isEmpty ? 0 : 70 + CGFloat(model.outputVolumes.count) * 34) + (updater.availableVersion == nil ? 0 : 44) + (updater.message == nil ? 0 : 24))
+        .frame(height: 624 + (model.outputVolumes.isEmpty ? 0 : 70 + CGFloat(model.outputVolumes.count) * 34) + (updater.availableVersion == nil ? 0 : 60) + (updater.message == nil ? 0 : 24))
         .background(ClearInitialFocus())
-        .onDisappear { model.stop() }
-        .task { updater.check() }
+        .onAppear { NSApp.setActivationPolicy(.regular) }
     }
 }
 
 private final class AppDelegate: NSObject, NSApplicationDelegate {
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    /// Keep running (and syncing) with no window open; the menu bar item reopens it or quits.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let path = Bundle.main.path(forResource: "AppIcon", ofType: "png"), let icon = NSImage(contentsOfFile: path) {
             NSApplication.shared.applicationIconImage = icon
         }
+        // Drop the Dock icon while the window is closed; the app lives in the menu bar until it reopens.
+        NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { note in
+            guard let closing = note.object as? NSWindow, closing.canBecomeMain else { return }
+            let othersOpen = NSApp.windows.contains { $0 !== closing && $0.isVisible && $0.canBecomeMain }
+            if !othersOpen { NSApp.setActivationPolicy(.accessory) }
+        }
+        Task { @MainActor in Updater.shared.check() }
     }
 }
 
 @main
 private struct SyncDelayApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @StateObject private var model = SyncDelayModel()
+
     var body: some Scene {
-        WindowGroup { ContentView() }
+        Window("Sync Delay", id: mainWindowID) { ContentView(model: model) }
             .commands {
                 CommandGroup(after: .appInfo) {
                     Button("Check for Updates…") { Updater.shared.check(userInitiated: true) }
                 }
             }
             .windowResizability(.contentSize)
+        MenuBarExtra {
+            MenuBarContent(model: model)
+        } label: {
+            Image(systemName: model.isRunning ? "speaker.wave.2.circle.fill" : "speaker.slash.circle")
+        }
     }
 }
