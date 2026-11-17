@@ -597,7 +597,8 @@ private final class SyncDelayModel: ObservableObject {
                 self.startEngine(note: "reconnected after sleep")
             }
         }
-        if autoStart, !outputUID.isEmpty { start() }
+        // A second copy would play everything twice; it hands off to the running one and quits.
+        if autoStart, !outputUID.isEmpty, alreadyRunningCopy == nil { start() }
     }
     deinit { engine?.stop(); tickTimer?.invalidate() }
 
@@ -911,11 +912,7 @@ private struct MenuBarContent: View {
         return model.hasError ? "Not running · open the window for details" : "Stopped"
     }
 
-    private func showWindow() {
-        NSApp.setActivationPolicy(.regular)
-        openWindow(id: mainWindowID)
-        NSApp.activate(ignoringOtherApps: true)
-    }
+    private func showWindow() { showMainWindow(fallback: openWindow) }
 
     var body: some View {
         Text(summary)
@@ -943,6 +940,25 @@ private struct MenuBarContent: View {
 }
 
 private let mainWindowID = "main"
+
+/// Brings the main window back. SwiftUI keeps the closed window object (id "main") alive but
+/// `openWindow` doesn't re-show it, so order the existing window front and only fall back to
+/// `openWindow` if it's really gone.
+@MainActor
+private func showMainWindow(fallback: OpenWindowAction? = nil) {
+    NSApp.setActivationPolicy(.regular)
+    if let window = NSApp.windows.first(where: { $0.identifier?.rawValue == mainWindowID }) {
+        window.makeKeyAndOrderFront(nil)
+    } else {
+        fallback?(id: mainWindowID)
+    }
+    NSApp.activate(ignoringOtherApps: true)
+}
+
+/// Another copy of Sync Delay (same bundle ID) that was already running when this one launched.
+private let alreadyRunningCopy: NSRunningApplication? = NSRunningApplication
+    .runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.syncdelay.app")
+    .first { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
 
 private struct ContentView: View {
     @ObservedObject var model: SyncDelayModel
@@ -1111,6 +1127,22 @@ private struct ContentView: View {
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Keep running (and syncing) with no window open; the menu bar item reopens it or quits.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    /// Opening the app again (Finder, Spotlight, Dock) while it runs with no window shows the window.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        if !hasVisibleWindows { Task { @MainActor in showMainWindow() } }
+        return false
+    }
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        guard let other = alreadyRunningCopy else { return }
+        // Ask the running copy to show its window (sends it a reopen event), then quit this one.
+        if let url = other.bundleURL {
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { _, _ in
+                DispatchQueue.main.async { NSApp.terminate(nil) }
+            }
+        } else {
+            NSApp.terminate(nil)
+        }
+    }
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let path = Bundle.main.path(forResource: "AppIcon", ofType: "png"), let icon = NSImage(contentsOfFile: path) {
             NSApplication.shared.applicationIconImage = icon
